@@ -2,6 +2,8 @@ import { Body, Controller, Delete, HttpCode, Patch, Post, UseGuards } from "@nes
 import { ApiHeader, ApiOperation, ApiTags } from "@nestjs/swagger";
 import { AdminGuard, CurrentAdmin, RequireAdminRole } from "../admin/admin.guard";
 import { AdminPrincipal } from "../admin/admin-auth";
+import { ApiKeyScopeGuard } from "../auth/api-keys/api-key-scope.guard";
+import { RequireApiKeyScope } from "../auth/api-keys/require-api-key-scope.decorator";
 import { AdminTokensService } from "./admin-tokens.service";
 import { CreateAdminTokenDto, DeleteAdminTokenDto, PatchAdminTokenDto } from "./dto/admin-token.dto";
 
@@ -15,8 +17,9 @@ import { CreateAdminTokenDto, DeleteAdminTokenDto, PatchAdminTokenDto } from "./
 @ApiTags("admin")
 @ApiHeader({ name: "x-admin-key", required: true })
 @Controller({ path: "admin/tokens", version: "1" })
-@UseGuards(AdminGuard)
+@UseGuards(AdminGuard, ApiKeyScopeGuard)
 @RequireAdminRole("admin")
+@RequireApiKeyScope("admin:tokens:write")
 export class AdminTokensController {
   constructor(private readonly tokens: AdminTokensService) {}
 

@@ -2,6 +2,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { PrismaService } from "../prisma/prisma.service";
 import { AppConfig } from "../config/configuration";
+import { MetricsService } from "../metrics/metrics.service";
 import { ArchivalConfig } from "./archival-config";
 import { ArchivalS3Client } from "./s3-client";
 import { writeIntentsParquet, writeAuditParquet } from "./parquet-writer";
@@ -27,6 +28,29 @@ export interface ArchivalRunResult {
 }
 
 /**
+ * Result of one integrity re-verification sweep (#697).
+ */
+export interface ArchivalVerifyResult {
+  /** Number of partitions whose manifests were checked this run. */
+  partitionsChecked: number;
+  /** Number of partitions whose files all matched their recorded digests. */
+  partitionsOk: number;
+  /** Number of partitions with at least one mismatch / missing file. */
+  partitionsFailed: number;
+  /** Per-partition failure details (empty when everything verified). */
+  failures: Array<{
+    date: string;
+    key: string;
+    reason: string;
+    expected?: string | number;
+    actual?: string | number;
+  }>;
+  /** Rotation cursor persisted for the next run (last verified date). */
+  cursor: string | null;
+  durationMs: number;
+}
+
+/**
  * ArchivalService (#413).
  *
  * Exports terminal intents (filled / cancelled / expired / slashed) that are
@@ -41,6 +65,9 @@ export interface ArchivalRunResult {
  *   - Safe deletion: rows are deleted from Postgres only after the manifest
  *     checksum passes verification.  A failed upload / verify never deletes.
  *   - Audit entries go with their intents so the export is self-contained.
+ *   - Integrity re-verification: `verifyArchivedPartitions()` re-checks a
+ *     rolling sample of archived manifests (#697); see
+ *     `docs/archival-design.md` for the rotation/sampling design notes.
  */
 @Injectable()
 export class ArchivalService {
@@ -51,6 +78,7 @@ export class ArchivalService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService<AppConfig, true>,
+    private readonly metrics: MetricsService,
   ) {
     this.archivalConfig = this.configService.get("archival", { infer: true });
     this.s3 = new ArchivalS3Client(this.archivalConfig);
@@ -288,6 +316,186 @@ export class ArchivalService {
       durationMs,
       manifestKey,
     };
+  }
+
+  /**
+   * Re-verify a rolling sample of previously archived date partitions (#697).
+   *
+   * Once `archiveDate()` deletes the Postgres rows, the Parquet files in S3
+   * are the only copy of that data.  This method periodically re-runs
+   * `verifyManifest()` against a rotating window of archived partitions so
+   * silent bit rot / accidental overwrites / lifecycle-policy mistakes are
+   * detected long before a restore is attempted.
+   *
+   * Rotation: archived partitions are discovered by listing manifest keys
+   * under `partitionPrefix` (no side-table).  A cursor (the last verified
+   * date) is persisted in S3 so each run verifies the next
+   * `verifySampleSize` partitions after it, wrapping around at the end.
+   *
+   * Detection only — mismatches are logged and counted, never repaired.
+   */
+  async verifyArchivedPartitions(): Promise<ArchivalVerifyResult> {
+    const start = Date.now();
+    const failures: ArchivalVerifyResult["failures"] = [];
+
+    // ── Step 1: discover archived partitions via manifest keys ───────────────
+    const manifestKeys = await this.s3.listKeys(this.archivalConfig.partitionPrefix);
+    const dates = manifestKeys
+      .filter((key) => key.endsWith("/manifest.json"))
+      .map((key) => this.dateFromManifestKey(key))
+      .filter((d): d is string => d !== null)
+      .sort();
+
+    if (dates.length === 0) {
+      this.logger.log("[archival-verify] no archived partitions found — nothing to verify");
+      return {
+        partitionsChecked: 0,
+        partitionsOk: 0,
+        partitionsFailed: 0,
+        failures,
+        cursor: null,
+        durationMs: Date.now() - start,
+      };
+    }
+
+    // ── Step 2: read the persisted rotation cursor ───────────────────────────
+    const cursorKey = this.verifyCursorKey();
+    let cursor: string | null = null;
+    try {
+      const raw = await this.s3.get(cursorKey);
+      const parsed = JSON.parse(raw.toString("utf-8")) as { cursor?: string };
+      cursor = typeof parsed.cursor === "string" ? parsed.cursor : null;
+    } catch {
+      // No cursor yet (first run) or unreadable — start from the beginning.
+      cursor = null;
+    }
+
+    // ── Step 3: select the next window, wrapping around ──────────────────────
+    const sampleSize = Math.max(1, this.archivalConfig.verifySampleSize);
+    let startIndex = 0;
+    if (cursor !== null) {
+      const idx = dates.findIndex((d) => d > cursor);
+      startIndex = idx === -1 ? 0 : idx;
+    }
+    const selected: string[] = [];
+    for (let i = 0; i < Math.min(sampleSize, dates.length); i++) {
+      selected.push(dates[(startIndex + i) % dates.length]);
+    }
+
+    this.logger.log(
+      `[archival-verify] verifying ${selected.length}/${dates.length} partitions ` +
+      `(cursor=${cursor ?? "none"})`,
+    );
+
+    // ── Step 4: verify each selected partition ───────────────────────────────
+    let partitionsOk = 0;
+    let partitionsFailed = 0;
+
+    for (const date of selected) {
+      const partitionFailures = await this.verifyPartition(date);
+      if (partitionFailures.length === 0) {
+        partitionsOk++;
+      } else {
+        partitionsFailed++;
+        failures.push(...partitionFailures);
+      }
+    }
+
+    // ── Step 5: persist the new cursor (last verified date) ──────────────────
+    const newCursor = selected[selected.length - 1] ?? cursor;
+    if (newCursor !== null) {
+      try {
+        await this.s3.put(
+          cursorKey,
+          Buffer.from(JSON.stringify({ cursor: newCursor, updatedAt: new Date().toISOString() }), "utf-8"),
+          "application/json",
+        );
+      } catch (err) {
+        this.logger.warn(
+          `[archival-verify] failed to persist rotation cursor: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    const durationMs = Date.now() - start;
+    this.logger.log(
+      `[archival-verify] done — checked=${selected.length} ok=${partitionsOk} ` +
+      `failed=${partitionsFailed} duration=${durationMs}ms`,
+    );
+
+    return {
+      partitionsChecked: selected.length,
+      partitionsOk,
+      partitionsFailed,
+      failures,
+      cursor: newCursor,
+      durationMs,
+    };
+  }
+
+  /**
+   * Verify a single archived partition's manifest and files.
+   * Returns the list of failures (empty when everything matches).
+   */
+  private async verifyPartition(
+    date: string,
+  ): Promise<ArchivalVerifyResult["failures"]> {
+    const failures: ArchivalVerifyResult["failures"] = [];
+    const manifestKey = this.manifestKey(date);
+
+    let manifest: ArchivalManifest;
+    try {
+      const raw = await this.s3.get(manifestKey);
+      manifest = JSON.parse(raw.toString("utf-8")) as ArchivalManifest;
+    } catch (err) {
+      const reason = `manifest unreadable: ${(err as Error).message}`;
+      this.recordMismatch(date, manifestKey, reason);
+      failures.push({ date, key: manifestKey, reason });
+      return failures;
+    }
+
+    try {
+      await verifyManifest(manifest, (key) => this.s3.get(key));
+    } catch (err) {
+      // verifyManifest throws on the first mismatch; surface it structurally.
+      const message = (err as Error).message;
+      const reason = message || "checksum/size mismatch";
+      this.recordMismatch(date, manifestKey, reason);
+      failures.push({ date, key: manifestKey, reason });
+    }
+
+    return failures;
+  }
+
+  /** Emit a structured error log and increment the integrity-failure metric. */
+  private recordMismatch(date: string, key: string, reason: string): void {
+    this.logger.error({
+      event: "archival.integrity.mismatch",
+      date,
+      key,
+      reason,
+    });
+    try {
+      this.metrics.incrementArchivalIntegrityFailures({ date });
+    } catch {
+      // Metrics must never break verification.
+    }
+  }
+
+  /** Extract the YYYY-MM-DD date from a manifest key, or null if malformed. */
+  private dateFromManifestKey(key: string): string | null {
+    const prefix = this.archivalConfig.partitionPrefix;
+    if (!key.startsWith(prefix)) return null;
+    const rest = key.slice(prefix.length);
+    const slash = rest.indexOf("/");
+    if (slash <= 0) return null;
+    const date = rest.slice(0, slash);
+    return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
+  }
+
+  /** S3 key of the persisted rotation cursor. */
+  private verifyCursorKey(): string {
+    return `${this.archivalConfig.partitionPrefix}_verify-cursor.json`;
   }
 
   /**

@@ -1,8 +1,9 @@
 import { Logger } from "@nestjs/common";
-import { Job, Queue, Worker } from "bullmq";
+import { FlowProducer, Job, Queue, Worker } from "bullmq";
 import {
   DeadLetter,
   EnqueueOptions,
+  JobChainStep,
   JobDefinition,
   JobEvents,
   JobHandler,
@@ -30,8 +31,11 @@ export class BullMqJobQueueDriver implements JobQueueDriver {
   private readonly queueMap = new Map<string, { queue: Queue; dlq: Queue; settings: QueueSettings }>();
   private readonly workers = new Map<string, Worker>();
   private readonly handlers = new Map<string, Map<string, { handler: JobHandler<unknown>; events: JobEvents; def: JobDefinition }>>();
+  private readonly flowProducer: FlowProducer;
 
-  constructor(private readonly redisUrl: string) {}
+  constructor(private readonly redisUrl: string) {
+    this.flowProducer = new FlowProducer({ connection: { url: redisUrl } });
+  }
 
   defineQueue(name: string, settings: QueueSettings): void {
     if (this.queueMap.has(name)) return;
@@ -49,6 +53,37 @@ export class BullMqJobQueueDriver implements JobQueueDriver {
       jobId: opts.idempotencyKey,
       delay: opts.delayMs,
     });
+    return job.id as string;
+  }
+
+  /**
+   * Enqueues a linear chain via BullMQ's FlowProducer: each step is added as
+   * the `children` of the next, so BullMQ only moves a step to `waiting` once
+   * its parent completes successfully. Steps may live on different queues.
+   * Returns the first (root) job's id.
+   */
+  async enqueueChain<T>(steps: JobChainStep<T>[]): Promise<string> {
+    if (steps.length === 0) throw new Error("enqueueChain() requires at least one step");
+    for (const step of steps) this.entry(step.def.queue);
+
+    // Build from the last step backwards so each node nests the previous one.
+    let node: Parameters<FlowProducer["add"]>[0] | undefined;
+    for (let i = steps.length - 1; i >= 0; i--) {
+      const { def, data, opts } = steps[i];
+      node = {
+        name: def.name,
+        queueName: def.queue,
+        data,
+        opts: {
+          ...this.jobOptions(def),
+          jobId: opts?.idempotencyKey,
+          delay: opts?.delayMs,
+        },
+        children: node ? [node] : undefined,
+      };
+    }
+
+    const { job } = await this.flowProducer.add(node!);
     return job.id as string;
   }
 
@@ -144,6 +179,7 @@ export class BullMqJobQueueDriver implements JobQueueDriver {
     await Promise.all(
       [...this.queueMap.values()].flatMap(({ queue, dlq }) => [queue.close(), dlq.close()]),
     );
+    await this.flowProducer.close();
   }
 
   queues(): string[] {

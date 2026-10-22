@@ -201,3 +201,171 @@ describe("ArchivalService (#413)", () => {
     expect(sha256Hex(Buffer.from("different", "utf-8"))).not.toBe(digest);
   });
 });
+
+// ── integrity re-verification (#697) ─────────────────────────────────────────
+
+describe("ArchivalService.verifyArchivedPartitions (#697)", () => {
+  let service: ArchivalService;
+  let s3Store: Map<string, Buffer>;
+  let s3List: jest.Mock;
+  let metrics: { increment: jest.Mock };
+  let loggerError: jest.SpyInstance;
+
+  const DATES = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"];
+
+  function makeManifest(date: string, files: Array<{ key: string; body: Buffer }>) {
+    return {
+      date,
+      createdAt: new Date().toISOString(),
+      totalIntentRows: files.length,
+      totalAuditRows: 0,
+      files: files.map((f) => ({
+        key: f.key,
+        rows: 1,
+        bytes: f.body.length,
+        sha256: sha256Hex(f.body),
+      })),
+    };
+  }
+
+  function seedPartition(date: string, body = Buffer.from(`parquet-${date}`)) {
+    const key = `date=${date}/part-0000.parquet`;
+    s3Store.set(key, body);
+    const manifest = makeManifest(date, [{ key, body }]);
+    s3Store.set(`date=${date}/manifest.json`, Buffer.from(JSON.stringify(manifest)));
+    return { key, manifest };
+  }
+
+  beforeEach(() => {
+    s3Store = new Map();
+    s3List = jest.fn().mockImplementation(async (prefix: string) => {
+      // Return every manifest key under the prefix, mirroring ListObjectsV2.
+      return Array.from(s3Store.keys())
+        .filter((k) => k.startsWith(prefix) && k.endsWith("manifest.json"))
+        .sort();
+    });
+
+    metrics = { increment: jest.fn() };
+
+    const mockPrisma = {} as unknown as PrismaService;
+    service = new ArchivalService(mockPrisma, makeConfig(), metrics as never);
+
+    const s3Client = (service as unknown as {
+      s3: { get: jest.Mock; list: jest.Mock };
+    }).s3;
+    s3Client.get = jest.fn().mockImplementation(async (key: string) => {
+      const data = s3Store.get(key);
+      if (!data) {
+        const err = new Error(`NoSuchKey: ${key}`);
+        (err as Error & { name: string }).name = "NoSuchKey";
+        throw err;
+      }
+      return data;
+    });
+    s3Client.list = s3List;
+
+    loggerError = jest.spyOn(
+      (service as unknown as { logger: { error: (...a: unknown[]) => void } }).logger,
+      "error",
+    ).mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it("happy path: verifies every manifest and reports no failures", async () => {
+    for (const d of DATES) seedPartition(d);
+
+    const result = await service.verifyArchivedPartitions({ limit: 10 });
+
+    expect(result.checked).toBe(DATES.length);
+    expect(result.failures).toEqual([]);
+    expect(metrics.increment).not.toHaveBeenCalledWith(
+      expect.stringMatching(/integrity/i),
+      expect.anything(),
+    );
+    expect(loggerError).not.toHaveBeenCalled();
+  });
+
+  it("detects a corrupted file (checksum mismatch) and increments a metric", async () => {
+    seedPartition("2026-01-01");
+    const { key } = seedPartition("2026-01-02");
+    // Overwrite the parquet body so the recorded SHA-256 no longer matches.
+    s3Store.set(key, Buffer.from("bit-rot"));
+
+    const result = await service.verifyArchivedPartitions({ limit: 10 });
+
+    expect(result.checked).toBe(2);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]).toMatchObject({
+      date: "2026-01-02",
+      key,
+      reason: "checksum_mismatch",
+    });
+    expect(metrics.increment).toHaveBeenCalledWith(
+      "archival_integrity_failure_total",
+      expect.objectContaining({ reason: "checksum_mismatch" }),
+    );
+    expect(loggerError).toHaveBeenCalled();
+  });
+
+  it("detects a missing file (S3 get throws) and increments a metric", async () => {
+    seedPartition("2026-01-01");
+    const { key } = seedPartition("2026-01-02");
+    s3Store.delete(key);
+
+    const result = await service.verifyArchivedPartitions({ limit: 10 });
+
+    expect(result.checked).toBe(2);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]).toMatchObject({
+      date: "2026-01-02",
+      key,
+      reason: "missing_file",
+    });
+    expect(metrics.increment).toHaveBeenCalledWith(
+      "archival_integrity_failure_total",
+      expect.objectContaining({ reason: "missing_file" }),
+    );
+    expect(loggerError).toHaveBeenCalled();
+  });
+
+  it("detects a size mismatch even when the digest happens to match", async () => {
+    const { key, manifest } = seedPartition("2026-01-01");
+    manifest.files[0].bytes = manifest.files[0].bytes + 1;
+    s3Store.set("date=2026-01-01/manifest.json", Buffer.from(JSON.stringify(manifest)));
+
+    const result = await service.verifyArchivedPartitions({ limit: 10 });
+
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]).toMatchObject({ key, reason: "size_mismatch" });
+  });
+
+  it("only verifies `limit` partitions per run and advances the rotation cursor", async () => {
+    for (const d of DATES) seedPartition(d);
+
+    const first = await service.verifyArchivedPartitions({ limit: 2 });
+    expect(first.checked).toBe(2);
+    expect(first.checkedDates).toEqual(["2026-01-01", "2026-01-02"]);
+
+    const second = await service.verifyArchivedPartitions({ limit: 2 });
+    expect(second.checked).toBe(2);
+    expect(second.checkedDates).toEqual(["2026-01-03", "2026-01-04"]);
+
+    const third = await service.verifyArchivedPartitions({ limit: 2 });
+    expect(third.checked).toBe(1);
+    expect(third.checkedDates).toEqual(["2026-01-05"]);
+
+    // Wraps back around to the oldest partition.
+    const fourth = await service.verifyArchivedPartitions({ limit: 2 });
+    expect(fourth.checkedDates).toEqual(["2026-01-01", "2026-01-02"]);
+  });
+
+  it("returns an empty result when no partitions have been archived", async () => {
+    const result = await service.verifyArchivedPartitions({ limit: 5 });
+    expect(result.checked).toBe(0);
+    expect(result.failures).toEqual([]);
+    expect(s3List).toHaveBeenCalled();
+  });
+});
